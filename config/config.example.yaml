@@ -1,0 +1,45 @@
+# The issuer URL must be the externally reachable URL of this gateway.
+listen: ":8080"
+issuer: "https://identity.example.com"
+
+# Only requests from these addresses may supply trusted identity headers.
+# Put the address range of the NetBird reverse proxy or a mutually-authenticated
+# ingress here. Never use 0.0.0.0/0 in production.
+trusted_proxy_cidrs:
+  - "10.10.0.0/24"
+
+identity:
+  user_header: "X-NetBird-User"
+  groups_header: "X-NetBird-Groups"
+  allow_unmapped: false
+  mappings:
+    alice@example.com:
+      subject: "authentik-user-uuid"
+      email: "alice@example.com"
+      name: "Alice Example"
+      preferred_username: "alice"
+      groups:
+        - "engineering"
+      claims:
+        forgejo_role: "developer"
+
+# Browser users without trusted headers are sent to this upstream provider.
+# Register redirect_url as an allowed callback at the upstream provider.
+fallback_oidc:
+  issuer: "https://auth.example.com/application/o/gateway/"
+  client_id: "identity-gateway"
+  client_secret: "replace-me"
+  redirect_url: "https://identity.example.com/oauth2/callback"
+  scopes: ["openid", "profile", "email", "groups"]
+
+clients:
+  forgejo:
+    secret: "replace-with-a-client-secret"
+    redirect_uris:
+      - "https://git.example.com/user/oauth2/identity-gateway/callback"
+
+# Leave empty to generate an ephemeral key at startup. Production deployments
+# should mount a stable PKCS#1 or PKCS#8 RSA key and set its path here.
+signing_key: ""
+session_ttl_seconds: 28800
+authorization_code_ttl_seconds: 60
