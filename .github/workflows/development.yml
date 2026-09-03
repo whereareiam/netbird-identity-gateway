@@ -1,0 +1,37 @@
+name: Development build
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.details.outputs.version }}
+    steps:
+      - name: Extract development version
+        id: details
+        run: |
+          branch_name="${GITHUB_REF_NAME//\//-}"
+          echo "version=${branch_name}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Build and publish
+        uses: whereareiam/devops/actions/registry/docker-publish@v2
+        with:
+          visibility: public
+          tags: |
+            ${{ needs.prepare.outputs.version }}
+            dev
