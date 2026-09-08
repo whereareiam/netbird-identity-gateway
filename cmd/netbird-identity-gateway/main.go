@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/rsa"
 	"errors"
 	"flag"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -48,19 +46,31 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	httpServer := &http.Server{
-		Addr:              config.Listen,
-		Handler:           server.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
+	newHTTPServer := func(addr string, handler http.Handler) *http.Server {
+		return &http.Server{
+			Addr:              addr,
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			MaxHeaderBytes:    8192,
+		}
 	}
+	httpServer := newHTTPServer(config.Listen, server.Handler())
+	backchannel := newHTTPServer(config.BackchannelListen, server.BackchannelHandler())
+	go func() {
+		if err := backchannel.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("backchannel stopped", "error", err)
+			stop()
+		}
+	}()
 
 	go func() {
 		<-ctx.Done()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		_ = backchannel.Shutdown(shutdownContext)
 		if err := httpServer.Shutdown(shutdownContext); err != nil {
 			logger.Error("shutting down HTTP server", "error", err)
 		}
@@ -81,10 +91,6 @@ func envOr(name, fallback string) string {
 }
 
 func loadSigner(config string) (*rsa.PrivateKey, error) {
-	if strings.TrimSpace(config) == "" {
-		return rsa.GenerateKey(rand.Reader, 2048)
-	}
-
 	contents, err := os.ReadFile(config)
 	if err != nil {
 		return nil, fmt.Errorf("read signing key %q: %w", config, err)

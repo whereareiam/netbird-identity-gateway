@@ -5,12 +5,16 @@ import (
 	"strings"
 )
 
-func (server *Server) userinfo(writer http.ResponseWriter, request *http.Request) {
-	value := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
-	claims, err := server.verifyToken(value)
-	if err != nil {
-		server.writeJSON(writer, http.StatusUnauthorized, map[string]string{"error": "invalid_token"})
+func (s *Server) userinfo(w http.ResponseWriter, r *http.Request) {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") {
+		s.writeJSON(w, 401, map[string]string{"error": "invalid_token"})
 		return
 	}
-	server.writeJSON(writer, http.StatusOK, claims)
+	c, e := s.verifyAccessToken(strings.TrimPrefix(values[0], "Bearer "))
+	if e != nil {
+		s.writeJSON(w, 401, map[string]string{"error": "invalid_token"})
+		return
+	}
+	s.writeJSON(w, 200, map[string]string{"sub": c.Subject})
 }

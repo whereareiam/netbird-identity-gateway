@@ -4,67 +4,77 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"regexp"
 	"time"
 )
 
 type authorizationCode struct {
-	ClientID            string
-	RedirectURI         string
-	Nonce               string
-	CodeChallenge       string
-	CodeChallengeMethod string
-	Identity            identity
-	ExpiresAt           time.Time
+	Subject, ClientID, RedirectURI, Nonce, Challenge string
+	ExpiresAt                                        time.Time
 }
 
-func (server *Server) validateAuthorization(query url.Values) (string, string, error) {
-	clientID := query.Get("client_id")
-	redirectURI := query.Get("redirect_uri")
-	challenge := query.Get("code_challenge")
-	method := query.Get("code_challenge_method")
-	if challenge != "" && method != "S256" {
-		return "", "", errors.New("only S256 PKCE is supported")
-	}
-	if query.Get("response_type") != "code" || clientID == "" || redirectURI == "" || !server.clientRedirectAllowed(clientID, redirectURI) {
-		return "", "", errors.New("invalid authorization request")
-	}
-	return clientID, redirectURI, nil
-}
+var challengePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+var verifierPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
 
-func (server *Server) issueCode(clientID, redirectURI, nonce, challenge, challengeMethod string, current identity) (string, error) {
-	code, err := randomToken(32)
-	if err != nil {
-		return "", err
+func (s *Server) validateAuthorization(q url.Values) error {
+	for k, v := range q {
+		if len(v) != 1 || len(v[0]) > 512 {
+			return errors.New("ambiguous or oversized parameter")
+		}
+		switch k {
+		case "client_id", "redirect_uri", "response_type", "scope", "state", "nonce", "code_challenge", "code_challenge_method", "prompt", "login_hint":
+		default:
+			return errors.New("unsupported parameter")
+		}
+	}
+	if q.Get("client_id") != s.config.Client.ID || q.Get("redirect_uri") != s.config.Client.RedirectURI || q.Get("response_type") != "code" || q.Get("scope") != "openid" {
+		return errors.New("invalid client, callback, response type or scope")
+	}
+	if !challengePattern.MatchString(q.Get("code_challenge")) || q.Get("code_challenge_method") != "S256" || q.Get("state") == "" {
+		return errors.New("S256 PKCE and state required")
+	}
+	if p := q.Get("prompt"); p != "" && p != "none" {
+		return errors.New("interactive authentication is not supported")
+	}
+	return nil
+}
+func (s *Server) issueCode(q url.Values, subject string) (string, error) {
+	code, e := randomToken(32)
+	if e != nil {
+		return "", e
 	}
 	now := time.Now()
-	server.mu.Lock()
-	server.cleanupExpiredLocked(now)
-	server.codes[code] = authorizationCode{ClientID: clientID, RedirectURI: redirectURI, Nonce: nonce, CodeChallenge: challenge, CodeChallengeMethod: challengeMethod, Identity: current, ExpiresAt: now.Add(time.Duration(server.config.CodeTTL) * time.Second)}
-	server.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !now.Before(s.nextCleanup) {
+		for k, c := range s.codes {
+			if !now.Before(c.ExpiresAt) {
+				delete(s.codes, k)
+			}
+		}
+		s.nextCleanup = now.Add(time.Second)
+	}
+	if len(s.codes) >= s.config.MaxCodes {
+		return "", errors.New("code capacity reached")
+	}
+	s.codes[code] = authorizationCode{Subject: subject, ClientID: q.Get("client_id"), RedirectURI: q.Get("redirect_uri"), Nonce: q.Get("nonce"), Challenge: q.Get("code_challenge"), ExpiresAt: now.Add(time.Duration(s.config.CodeTTL) * time.Second)}
 	return code, nil
 }
-
-func (server *Server) consumeCode(value string) (authorizationCode, bool) {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	code, ok := server.codes[value]
-	if ok {
-		delete(server.codes, value)
+func (s *Server) redeemCode(value, redirect, verifier string) (authorizationCode, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.codes[value]
+	if !ok {
+		return c, false
 	}
-	return code, ok && time.Now().Before(code.ExpiresAt)
+	delete(s.codes, value)
+	return c, time.Now().Before(c.ExpiresAt) && c.ClientID == s.config.Client.ID && c.RedirectURI == redirect && verifyPKCE(c, verifier)
 }
-
-func (server *Server) redirectWithCode(writer http.ResponseWriter, request *http.Request, redirectURI, state, code string) {
-	redirect, err := url.Parse(redirectURI)
-	if err != nil {
-		http.Error(writer, "invalid redirect URI", http.StatusInternalServerError)
-		return
-	}
-	query := redirect.Query()
-	query.Set("code", code)
-	if state != "" {
-		query.Set("state", state)
-	}
-	redirect.RawQuery = query.Encode()
-	http.Redirect(writer, request, redirect.String(), http.StatusFound)
+func (s *Server) redirectWithCode(w http.ResponseWriter, r *http.Request, state, code string) {
+	u, _ := url.Parse(s.config.Client.RedirectURI)
+	q := u.Query()
+	q.Set("code", code)
+	q.Set("state", state)
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
 }

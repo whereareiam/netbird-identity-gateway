@@ -3,68 +3,28 @@ package server
 import (
 	"net"
 	"net/http"
-	"strings"
 )
 
-type identity struct {
-	Subject           string
-	Email             string
-	Name              string
-	PreferredUsername string
-	Groups            []string
-	Claims            map[string]any
-}
+const principalHeader = "X-NetBird-Principal"
 
-func (server *Server) identityFromRequest(request *http.Request) (identity, bool) {
-	if !server.isTrustedProxy(request) {
-		return identity{}, false
+func (s *Server) identityFromRequest(r *http.Request) (string, bool) {
+	if !s.isTrustedProxy(r) {
+		return "", false
 	}
-	value := strings.TrimSpace(request.Header.Get(server.config.Identity.UserHeader))
-	if value == "" {
-		return identity{}, false
+	values := r.Header.Values(principalHeader)
+	if len(values) != 1 || !principalPattern.MatchString(values[0]) || !s.principals[values[0]] {
+		return "", false
 	}
-	if mapped, ok := server.config.Identity.Mappings[value]; ok {
-		if mapped.Subject == "" {
-			return identity{}, false
-		}
-		if mapped.PreferredUsername == "" {
-			mapped.PreferredUsername = mapped.Email
-		}
-		return identity{
-			Subject:           mapped.Subject,
-			Email:             mapped.Email,
-			Name:              mapped.Name,
-			PreferredUsername: mapped.PreferredUsername,
-			Groups:            mapped.Groups,
-			Claims:            mapped.Claims,
-		}, true
-	}
-	if !server.config.Identity.AllowUnmapped || strings.ContainsAny(value, "\r\n") {
-		return identity{}, false
-	}
-	return identity{
-		Subject:           value,
-		Email:             value,
-		PreferredUsername: value,
-		Groups:            splitGroups(request.Header.Get(server.config.Identity.GroupsHeader)),
-	}, true
+	return "netbird:" + values[0], true
 }
-
-func (server *Server) hasTrustedIdentity(request *http.Request) bool {
-	return server.isTrustedProxy(request) && strings.TrimSpace(request.Header.Get(server.config.Identity.UserHeader)) != ""
-}
-
-func (server *Server) isTrustedProxy(request *http.Request) bool {
-	host, _, err := net.SplitHostPort(request.RemoteAddr)
-	if err != nil {
-		host = request.RemoteAddr
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
+func (s *Server) isTrustedProxy(r *http.Request) bool {
+	host, _, e := net.SplitHostPort(r.RemoteAddr)
+	if e != nil {
 		return false
 	}
-	for _, network := range server.proxyNets {
-		if network.Contains(ip) {
+	ip := net.ParseIP(host)
+	for _, n := range s.proxyNets {
+		if n.Contains(ip) {
 			return true
 		}
 	}

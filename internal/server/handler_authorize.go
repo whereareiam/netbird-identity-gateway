@@ -1,43 +1,33 @@
 package server
 
-import "net/http"
+import (
+	"net/http"
+	"net/url"
+)
 
-func (server *Server) authorize(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet {
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
+	if len(r.URL.RawQuery) > 4096 {
+		http.Error(w, "request too large", http.StatusRequestURITooLong)
 		return
 	}
-	query := request.URL.Query()
-	clientID, redirectURI, err := server.validateAuthorization(query)
-	if err != nil {
-		http.Error(writer, err.Error(), http.StatusBadRequest)
+	q, e := url.ParseQuery(r.URL.RawQuery)
+	if e != nil {
+		http.Error(w, "invalid query", 400)
 		return
 	}
-	if current, ok := server.identityFromRequest(request); ok {
-		server.authorizeIdentity(writer, request, clientID, redirectURI, current)
+	if e = s.validateAuthorization(q); e != nil {
+		http.Error(w, e.Error(), 400)
 		return
 	}
-	if server.hasTrustedIdentity(request) {
-		http.Error(writer, "trusted identity is not mapped", http.StatusForbidden)
+	subject, ok := s.identityFromRequest(r)
+	if !ok {
+		http.Error(w, "verified linked NetBird principal required", 403)
 		return
 	}
-	if current, ok := server.sessionFromRequest(request); ok {
-		server.authorizeIdentity(writer, request, clientID, redirectURI, current)
+	code, e := s.issueCode(q, subject)
+	if e != nil {
+		http.Error(w, "authorization temporarily unavailable", 503)
 		return
 	}
-	if server.fallback == nil {
-		http.Error(writer, "no trusted identity and no fallback OIDC provider configured", http.StatusUnauthorized)
-		return
-	}
-	server.startFallbackLogin(writer, request, clientID, redirectURI)
-}
-
-func (server *Server) authorizeIdentity(writer http.ResponseWriter, request *http.Request, clientID, redirectURI string, current identity) {
-	query := request.URL.Query()
-	code, err := server.issueCode(clientID, redirectURI, query.Get("nonce"), query.Get("code_challenge"), query.Get("code_challenge_method"), current)
-	if err != nil {
-		http.Error(writer, "could not issue authorization code", http.StatusInternalServerError)
-		return
-	}
-	server.redirectWithCode(writer, request, redirectURI, query.Get("state"), code)
+	s.redirectWithCode(w, r, q.Get("state"), code)
 }

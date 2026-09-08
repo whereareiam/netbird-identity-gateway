@@ -44,21 +44,3 @@ func keyID(key *rsa.PublicKey) string {
 	hash := sha256.Sum256(append(key.N.Bytes(), byte(key.E>>8), byte(key.E)))
 	return base64.RawURLEncoding.EncodeToString(hash[:12])
 }
-
-func (server *Server) cleanupExpiredLocked(now time.Time) {
-	for value, code := range server.codes {
-		if now.After(code.ExpiresAt) {
-			delete(server.codes, value)
-		}
-	}
-	for value, state := range server.states {
-		if now.After(state.ExpiresAt) {
-			delete(server.states, value)
-		}
-	}
-	for value, currentSession := range server.sessions {
-		if now.After(currentSession.ExpiresAt) {
-			delete(server.sessions, value)
-		}
-	}
-}

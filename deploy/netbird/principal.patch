@@ -1,0 +1,146 @@
+diff --git a/proxy/internal/auth/middleware.go b/proxy/internal/auth/middleware.go
+index 72630b0..1ee8d67 100644
+--- a/proxy/internal/auth/middleware.go
++++ b/proxy/internal/auth/middleware.go
+@@ -11,6 +11,7 @@ import (
+ 	"net/http"
+ 	"net/netip"
+ 	"net/url"
++ "os"
+ 	"sync"
+ 	"time"
+ 
+@@ -375,7 +376,8 @@ func (mw *Middleware) forwardWithTunnelPeer(w http.ResponseWriter, r *http.Reque
+ 	if !isTunnelSourceIP(clientIP) {
+ 		return false
+ 	}
+-	if _, ok := lookup(clientIP); !ok {
++	peerIdentity, known := lookup(clientIP)
++ if !known {
+ 		mw.logger.WithFields(log.Fields{
+ 			"host":   host,
+ 			"remote": clientIP,
+@@ -383,11 +385,19 @@ func (mw *Middleware) forwardWithTunnelPeer(w http.ResponseWriter, r *http.Reque
+ 		return false
+ 	}
+ 
+-	resp, _, err := mw.tunnelCache.fetch(r.Context(), tunnelCacheKey{
+-		accountID: config.AccountID,
+-		tunnelIP:  clientIP,
+-		domain:    host,
+-	}, mw.validateTunnelPeer)
++	// Identity assertions require a fresh management decision, never a cached
++ // account/IP principal that could survive address reassignment.
++ freshIdentity := config.Private && host == os.Getenv("NB_PROXY_IDENTITY_DOMAIN")
++ var resp *proto.ValidateTunnelPeerResponse
++ var err error
++ if freshIdentity {
++  if peerIdentity.PubKey == "" { return false }
++  resp, err = mw.validateTunnelPeer(r.Context(), &proto.ValidateTunnelPeerRequest{Domain: host, TunnelIp: clientIP.String()})
++  currentPeer, ok := lookup(clientIP)
++  if !ok || currentPeer.PubKey != peerIdentity.PubKey { return false }
++ } else {
++  resp, _, err = mw.tunnelCache.fetch(r.Context(), tunnelCacheKey{accountID: config.AccountID, tunnelIP: clientIP, domain: host}, mw.validateTunnelPeer)
++ }
+ 	if err != nil {
+ 		mw.logger.WithError(err).Debug("ValidateTunnelPeer failed; falling back to OIDC")
+ 		return false
+@@ -399,6 +409,7 @@ func (mw *Middleware) forwardWithTunnelPeer(w http.ResponseWriter, r *http.Reque
+ 	setSessionCookie(w, resp.GetSessionToken(), config.SessionExpiration)
+ 	if cd := proxy.CapturedDataFromContext(r.Context()); cd != nil {
+ 		cd.SetOrigin(proxy.OriginAuth)
++		if freshIdentity { cd.SetMetadata("identity.fresh", "true") }
+ 		cd.SetUserID(resp.GetUserId())
+ 		cd.SetUserEmail(resp.GetUserEmail())
+ 		cd.SetUserGroups(resp.GetPeerGroupIds())
+diff --git a/proxy/internal/auth/tunnel_lookup_test.go b/proxy/internal/auth/tunnel_lookup_test.go
+index 808aa8b..302abd0 100644
+--- a/proxy/internal/auth/tunnel_lookup_test.go
++++ b/proxy/internal/auth/tunnel_lookup_test.go
+@@ -353,3 +353,30 @@ func TestPrivateService_ForwardsOnTunnelPeerSuccess(t *testing.T) {
+ 	assert.Equal(t, http.StatusOK, w.Code)
+ 	assert.True(t, called)
+ }
++
++func TestIdentityDomainRevalidatesPrincipal(t *testing.T) {
++ t.Setenv("NB_PROXY_IDENTITY_DOMAIN", "svc.example")
++ principal := "victim"
++ key := "victim-key"
++ validator := &stubSessionValidator{respFn: func(_ *proto.ValidateTunnelPeerRequest) *proto.ValidateTunnelPeerResponse {
++  return &proto.ValidateTunnelPeerResponse{Valid:true,SessionToken:"token",UserId:principal}
++ }}
++ mw := newTunnelMiddleware(t, validator)
++ config, _ := mw.getDomainConfig("svc.example")
++ config.Private = true
++ lookup := TunnelLookupFunc(func(_ netip.Addr)(PeerIdentity,bool){return PeerIdentity{PubKey:key},true})
++ for _,expected := range []string{"victim","new-peer"} {
++  principal=expected;key=expected+"-key"
++  w,r:=newTunnelRequest("100.64.0.10:55555")
++  cd:=&proxy.CapturedData{}
++  r=r.WithContext(proxy.WithCapturedData(WithTunnelLookup(r.Context(),lookup),cd))
++  require.True(t,mw.forwardWithTunnelPeer(w,r,"svc.example",config,http.HandlerFunc(func(http.ResponseWriter,*http.Request){})))
++  assert.Equal(t,expected,cd.GetUserID())
++  assert.Equal(t,"true",cd.GetMetadata()["identity.fresh"])
++ }
++ assert.Equal(t,int32(2),validator.tunnelCalls.Load())
++ // A peer change while management resolves the request must fail closed.
++ validator.respFn=func(_ *proto.ValidateTunnelPeerRequest)*proto.ValidateTunnelPeerResponse{key="changed-key";return &proto.ValidateTunnelPeerResponse{Valid:true,SessionToken:"token",UserId:"victim"}}
++ w,r:=newTunnelRequest("100.64.0.10:55555");r=r.WithContext(WithTunnelLookup(r.Context(),lookup))
++ assert.False(t,mw.forwardWithTunnelPeer(w,r,"svc.example",config,http.HandlerFunc(func(http.ResponseWriter,*http.Request){t.Fatal("forwarded reassigned peer")})))
++}
+diff --git a/proxy/internal/proxy/reverseproxy.go b/proxy/internal/proxy/reverseproxy.go
+index 9150c03..67d1281 100644
+--- a/proxy/internal/proxy/reverseproxy.go
++++ b/proxy/internal/proxy/reverseproxy.go
+@@ -3,6 +3,7 @@ package proxy
+ import (
+ 	"context"
+ 	"encoding/json"
++ "encoding/base64"
+ 	"errors"
+ 	"fmt"
+ 	"net"
+@@ -908,6 +909,7 @@ func isHeaderValueSafe(v string) bool {
+ // client-sent values first (anti-spoof). Skips when the request didn't
+ // carry CapturedData (early-path errors, internal endpoints).
+ func stampNetBirdIdentity(r *httputil.ProxyRequest) {
++	r.Out.Header.Del("X-NetBird-Principal")
+ 	r.Out.Header.Del(headerNetBirdUser)
+ 	r.Out.Header.Del(headerNetBirdGroups)
+ 
+@@ -915,6 +917,9 @@ func stampNetBirdIdentity(r *httputil.ProxyRequest) {
+ 	if cd == nil {
+ 		return
+ 	}
++	if account, principal := string(cd.GetAccountID()), cd.GetUserID(); cd.GetMetadata()["identity.fresh"] == "true" && account != "" && principal != "" {
++		r.Out.Header.Set("X-NetBird-Principal", base64.RawURLEncoding.EncodeToString([]byte(account))+":"+base64.RawURLEncoding.EncodeToString([]byte(principal)))
++	}
+ 	if email := cd.GetUserEmail(); isHeaderValueSafe(email) {
+ 		r.Out.Header.Set(headerNetBirdUser, email)
+ 	}
+diff --git a/proxy/internal/proxy/reverseproxy_test.go b/proxy/internal/proxy/reverseproxy_test.go
+index 83afee3..a077a10 100644
+--- a/proxy/internal/proxy/reverseproxy_test.go
++++ b/proxy/internal/proxy/reverseproxy_test.go
+@@ -1451,3 +1451,21 @@ func TestBuildRequestInput_PropagatesIdentityAndGroups(t *testing.T) {
+ 	assert.True(t, in.AgentNetwork, "agent-network target flag must reach the Input")
+ 	assert.Equal(t, body, in.Body, "captured body must reach the Input")
+ }
++
++func TestStampNetBirdPrincipal(t *testing.T) {
++ pr := newProxyRequest(t, "https://identity.example.test/oauth2/authorize", "203.0.113.1:12345")
++ pr.Out.Header.Set("X-NetBird-Principal", "forged:user")
++ stampNetBirdIdentity(pr)
++ assert.Empty(t, pr.Out.Header.Get("X-NetBird-Principal"))
++ cd := &CapturedData{}
++ cd.SetAccountID(types.AccountID("account"))
++ cd.SetUserID("immutable-user")
++ cd.SetMetadata("identity.fresh", "true")
++ pr.In = pr.In.WithContext(WithCapturedData(pr.In.Context(), cd))
++ pr.Out.Header.Set("X-NetBird-Principal", "forged:user")
++ stampNetBirdIdentity(pr)
++ assert.Equal(t, "YWNjb3VudA:aW1tdXRhYmxlLXVzZXI", pr.Out.Header.Get("X-NetBird-Principal"))
++ cd.SetUserID("")
++ stampNetBirdIdentity(pr)
++ assert.Empty(t, pr.Out.Header.Get("X-NetBird-Principal"))
++}

@@ -1,94 +1,87 @@
 # NetBird Identity Gateway
 
-NetBird Identity Gateway is a small, self-hosted OIDC broker for applications
-behind a trusted reverse proxy. It can automatically authenticate a request
-when a trusted proxy supplies a mapped identity, and it can fall back to a
-normal browser-based login at any OIDC provider.
+An identity-only OIDC source for Authentik. NetBird proves which principal is
+connecting; Authentik owns users, account status, application access, groups and
+application entitlements. Applications continue using their Authentik issuers.
 
-The default header names are compatible with the NetBird reverse proxy
-(`X-NetBird-User` and `X-NetBird-Groups`), but both are configurable. The
-gateway is not NetBird-specific and can be used with any proxy that can make
-the identity headers trustworthy.
+The gateway emits only an immutable `sub` and protocol claims. It has no user
+registration, email matching, groups, application roles, fallback login, browser
+sessions, refresh tokens or forward-auth endpoint. Old broker configurations are
+rejected by strict YAML parsing.
 
-## Features
+## Connect Authentik
 
-- OIDC discovery, authorization-code flow, token endpoint, UserInfo, and JWKS.
-- Trusted-header auto-login for private network or service-mesh gateways.
-- Upstream OIDC fallback for users without a trusted identity.
-- Explicit source-to-canonical-identity mappings.
-- Configurable groups and application claims.
-- Forward-auth verification endpoint for legacy applications.
-- One-time, short-lived authorization codes and signed RS256 tokens.
-- Secure HTTP defaults, structured request logging, and health checks.
-- Distroless container image and race-tested Go code.
+1. Build the gateway and the [NetBird proxy extension](deploy/netbird/Dockerfile).
+   The extension is pinned to upstream v0.77.1 commit
+   `79a06720b684768b421f0a54f3bb14f22704994f`. It strips incoming
+   `X-NetBird-Principal` and replaces it with the verified `base64url(accountID):base64url(principalID)`.
+   Set `NB_PROXY_IDENTITY_DOMAIN` to the gateway host. The proxy makes a fresh
+   management validation on every identity request and checks peer-key stability,
+   so cached IP identities cannot authenticate a reassigned peer. The standard `X-NetBird-User` display header is never accepted for login.
+2. Mount a stable RSA private key (at least 2048 bits) and a configuration based
+   on [the example](config/config.example.yaml). Configure exactly one confidential
+   client for Authentik and explicitly allow only the NetBird human principal IDs
+   you will link. A machine peer or a renamed/reassigned email is not a user link.
+3. Expose port 8080 only to the authenticated NetBird proxy. Expose port 8081 only
+   to Authentik over authenticated infrastructure transport. Enforce this using
+   NetworkPolicy and, where available, mesh mTLS; CIDR checking alone does not
+   establish proxy identity. Never expose the authorization listener through a
+   shared ingress that can preserve arbitrary identity headers.
+4. Create an Authentik OpenID Connect source with `pkce: S256`, Basic client
+   authentication and scopes `*openid`. Use the external gateway URL for the
+   authorization endpoint. Configure the token, UserInfo and JWKS endpoints on
+   the protected backchannel. The discovery document is on the backchannel;
+   deployments using different transport URLs must override those endpoint URLs.
+5. Pre-create source connections linking `netbird:<accountID>:<principalID>` to
+   existing Authentik users. Use identifier matching, disable enrollment, and
+   configure no user or group import mappings. Do not link by email. Keep source
+   authentication free of user-write/group-import stages.
+6. Select this source in the application's Authentik authentication flow while
+   retaining its authorization policies and property mappings. Keep applications
+   pointed at Authentik. Do not configure Authentik as a gateway fallback.
 
-## Security model
+A Bulwark login follows Bulwark → Authentik → gateway → Authentik → Bulwark.
+Authentik evaluates Bulwark access and emits Bulwark's application entitlements.
+Stalwart continues receiving Authentik-issued tokens. Existing sessions and tokens
+retain their configured lifetimes; automatic login is not instantaneous revocation
+of sessions already created by downstream applications.
 
-Trusted headers are authentication credentials. The gateway only accepts them
-when the direct TCP peer is within `trusted_proxy_cidrs`; it does not trust
-`X-Forwarded-For` to make this decision. Put the gateway on a private network,
-use mTLS or a service-mesh policy between the proxy and gateway, and ensure no
-alternate ingress can reach the gateway or the backend while retaining identity
-headers.
+## Operate the gateway
 
-The gateway strips no headers from an upstream application because it is not a
-reverse proxy. A fronting proxy must strip client-provided identity headers
-before adding its own. Unknown trusted identities are rejected by default.
-Use immutable canonical subjects in mappings and keep application authorization
-inside each application.
+Run a separate Deployment with one replica. Pending authorization codes are held
+in a bounded in-memory store; a restart invalidates them, and a login can be
+retried. Multiple replicas require shared code storage and are not supported.
+Use `Recreate` during rollout to avoid splitting code issuance and redemption.
 
-The in-memory code, session, and token stores are intentionally simple for the
-initial release. Run a single replica or provide sticky routing until a shared
-store implementation is added. Mount a stable signing key in production;
-otherwise every restart invalidates the published JWKS and tokens.
+Mount the signing key and client secret using Kubernetes Secrets. Run nonroot,
+with a read-only root filesystem, dropped capabilities, resource limits and no
+service-account token. Both listeners have `/healthz`; the backchannel cannot
+accept identity headers or issue authorization codes.
 
-## Configuration
+The gateway supports authorization-code flow, exact HTTPS callbacks, mandatory
+S256 PKCE, single-use codes, RS256 ID/access tokens and UserInfo. It accepts only
+`openid`. Nonce is echoed when supplied; it is optional for compatibility with
+Authentik's code flow. Tokens default to 60 seconds and have separate ID/access
+purposes. UserInfo returns only `sub` and rejects ID tokens.
 
-Copy [`config/config.example.yaml`](config/config.example.yaml) and edit it.
-The upstream provider's callback must be registered as:
+Requests with unknown principals fail closed with 403; invalid OAuth requests
+return 400. An exhausted code store returns 503. There is no interactive fallback.
+Logs contain method/path/duration, without headers, tokens or query strings.
 
-```text
-https://identity.example.com/oauth2/callback
-```
+## Build and publish
 
-Each downstream application is registered under `clients`. Its OIDC issuer is
-the gateway URL, for example:
-
-```text
-Issuer:        https://identity.example.com
-Authorization: https://identity.example.com/oauth2/authorize
-Token:         https://identity.example.com/oauth2/token
-JWKS:          https://identity.example.com/oauth2/jwks.json
-```
-
-The gateway's own authorization endpoint accepts `client_id`, `redirect_uri`,
-`response_type=code`, `scope`, `state`, and `nonce`. Applications should use
-the authorization-code flow and validate the ID token according to OIDC.
-
-For a legacy reverse-proxy integration, call `/auth/verify`. A successful
-response contains `X-Identity-Subject`, `X-Identity-Email`,
-`X-Identity-Name`, `X-Identity-Preferred-Username`, and
-`X-Identity-Groups` response headers. Only copy these headers to the backend
-after the gateway returns HTTP 200.
-
-## Run locally
-
-```bash
-go run ./cmd/netbird-identity-gateway -config config/config.example.yaml
-```
-
-The example config requires a reachable upstream OIDC provider. For unit tests
-and container builds:
-
-```bash
-make test
+```sh
 make test-race
+make lint
 make docker-build
 ```
 
+Pushes to `dev` run tests and publish gateway and proxy images through the existing
+GitHub OIDC registry workflow. Each receives an immutable `dev-<commit>` tag and
+an overwritable `dev` tag under `registry.whereareiam.me/images/whereareiam/`.
+Deploy by digest when possible so rollback does not depend on the mutable tag.
+
 ## License
 
-Copyright 2026 whereareiam and contributors.
-
-Licensed under the GNU Affero General Public License, version 3 or later. See
-[`LICENSE`](LICENSE).
+Copyright 2026 whereareiam and contributors. AGPL-3.0-or-later; see [LICENSE](LICENSE).
+The proxy extension builds NetBird's upstream source and preserves its image layout.
