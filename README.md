@@ -20,8 +20,9 @@ rejected by strict YAML parsing.
    so cached IP identities cannot authenticate a reassigned peer. The standard `X-NetBird-User` display header is never accepted for login.
 2. Mount a stable RSA private key (at least 2048 bits) and a configuration based
    on [the example](config/config.example.yaml). Configure exactly one confidential
-   client for Authentik and explicitly allow only the NetBird human principal IDs
-   you will link. A machine peer or a renamed/reassigned email is not a user link.
+   client for Authentik and choose either explicit `principals` or `trusted_accounts` for automatic linking.
+   Account trust requires the Authentik validation mapping described below;
+   the gateway assertion alone does not establish that a principal is human.
 3. Expose port 8080 only to the authenticated NetBird proxy. Expose port 8081 only
    to Authentik over authenticated infrastructure transport. Enforce this using
    NetworkPolicy and, where available, mesh mTLS; CIDR checking alone does not
@@ -32,10 +33,15 @@ rejected by strict YAML parsing.
    authorization endpoint. Configure the token, UserInfo and JWKS endpoints on
    the protected backchannel. The discovery document is on the backchannel;
    deployments using different transport URLs must override those endpoint URLs.
-5. Pre-create source connections linking `netbird:<accountID>:<principalID>` to
-   existing Authentik users. Use identifier matching, disable enrollment, and
-   configure no user or group import mappings. Do not link by email. Keep source
-   authentication free of user-write/group-import stages.
+5. Use identifier matching and disable enrollment. For automatic linking, install
+   the [immutable identity mapping](deploy/authentik/identity_linking.py) on this
+   source, rendered with the trusted NetBird account, pinned Authentik connector
+   ID and upstream Authentik client ID. It validates the Dex-wrapped immutable
+   `hashed_user_id`, resolves one active existing human user and creates only the
+   source connection. It rejects foreign connectors/accounts, machine principals,
+   unknown/disabled users and conflicting links. It returns no user attributes.
+   Keep source authentication free of user-write/group-import stages. Explicit
+   pre-created links remain supported with the gateway's `principals` allowlist.
 6. Select this source in the application's Authentik authentication flow while
    retaining its authorization policies and property mappings. Keep applications
    pointed at Authentik. Do not configure Authentik as a gateway fallback.
@@ -64,7 +70,8 @@ S256 PKCE, single-use codes, RS256 ID/access tokens and UserInfo. It accepts onl
 Authentik's code flow. Tokens default to 60 seconds and have separate ID/access
 purposes. UserInfo returns only `sub` and rejects ID tokens.
 
-Requests with unknown principals fail closed with 403; invalid OAuth requests
+In explicit-principal mode unknown principals fail with 403. In account-trust
+mode Authentik rejects identities that do not resolve through its pinned connector; invalid OAuth requests
 return 400. An exhausted code store returns 503. There is no interactive fallback.
 Logs contain method/path/duration, without headers, tokens or query strings.
 

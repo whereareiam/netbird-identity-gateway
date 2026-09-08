@@ -3,3 +3,5 @@
 *.test
 coverage.out
 .env
+
+__pycache__/

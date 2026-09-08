@@ -276,3 +276,32 @@ func TestEncodedExternalPrincipal(t *testing.T) {
 		t.Fatalf("encoded identity rejected: %d", w.Code)
 	}
 }
+
+func TestTrustedAccountAdmission(t *testing.T) {
+	s := testServer(t)
+	s.principals = map[string]bool{}
+	s.trustedAccounts = map[string]bool{base64.RawURLEncoding.EncodeToString([]byte("account")): true}
+	for _, x := range []struct {
+		principal, peer string
+		status          int
+	}{
+		{"YWNjb3VudA:bmV3LXVzZXI", "10.1.2.3:80", 302},
+		{"b3RoZXI:bmV3LXVzZXI", "10.1.2.3:80", 403},
+		{"YWNjb3VudA:bmV3LXVzZXI", "192.0.2.1:80", 403},
+		{"YWNjb3VudA:one:two", "10.1.2.3:80", 403},
+	} {
+		if w := authorizeRequest(s, authQuery(s), x.peer, []string{x.principal}); w.Code != x.status {
+			t.Fatalf("%s: %d", x.principal, w.Code)
+		}
+	}
+	c := s.config
+	c.Principals = nil
+	c.TrustedAccounts = []string{"account"}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.TrustedAccounts = nil
+	if err := c.Validate(); err == nil {
+		t.Fatal("empty trust accepted")
+	}
+}

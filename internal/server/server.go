@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/rsa"
+	"encoding/base64"
 	"fmt"
 	"github.com/go-jose/go-jose/v4"
 	"log/slog"
@@ -13,15 +14,16 @@ import (
 
 // Server proves linked NetBird identities. It owns no users or entitlements.
 type Server struct {
-	config      Config
-	signer      jose.Signer
-	publicKey   *rsa.PublicKey
-	logger      *slog.Logger
-	proxyNets   []*net.IPNet
-	principals  map[string]bool
-	mu          sync.Mutex
-	codes       map[string]authorizationCode
-	nextCleanup time.Time
+	config          Config
+	signer          jose.Signer
+	publicKey       *rsa.PublicKey
+	logger          *slog.Logger
+	proxyNets       []*net.IPNet
+	principals      map[string]bool
+	trustedAccounts map[string]bool
+	mu              sync.Mutex
+	codes           map[string]authorizationCode
+	nextCleanup     time.Time
 }
 
 // NewServer validates the complete configuration before accepting requests.
@@ -39,9 +41,12 @@ func NewServer(c Config, key *rsa.PrivateKey, logger *slog.Logger) (*Server, err
 	if e != nil {
 		return nil, e
 	}
-	s := &Server{config: c, signer: signer, publicKey: &key.PublicKey, logger: logger, codes: map[string]authorizationCode{}, principals: map[string]bool{}}
+	s := &Server{config: c, signer: signer, publicKey: &key.PublicKey, logger: logger, codes: map[string]authorizationCode{}, principals: map[string]bool{}, trustedAccounts: map[string]bool{}}
 	for _, p := range c.Principals {
 		s.principals[p] = true
+	}
+	for _, account := range c.TrustedAccounts {
+		s.trustedAccounts[base64.RawURLEncoding.EncodeToString([]byte(account))] = true
 	}
 	for _, cidr := range c.TrustedProxyCIDRs {
 		_, n, _ := net.ParseCIDR(cidr)

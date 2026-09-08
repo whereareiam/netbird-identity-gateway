@@ -7,6 +7,10 @@ trusted_proxy_cidrs: ["10.10.0.5/32"]
 # Immutable account:principal IDs supplied by the patched NetBird proxy.
 # Include only human principals explicitly linked to existing Authentik users.
 principals: ["netbird-account-id:immutable-user-id"]
+# Alternatively, with the Authentik immutable auto-link mapping installed:
+# trusted_accounts: ["raw-netbird-account-id"]
+# Omit principals in that mode. The gateway proves the principal; Authentik
+# validates its connector and resolves an active existing human user.
 client:
   id: authentik-netbird
   secret: replace-with-at-least-32-random-bytes

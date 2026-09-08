@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ type Config struct {
 	Issuer            string   `yaml:"issuer"`
 	TrustedProxyCIDRs []string `yaml:"trusted_proxy_cidrs"`
 	Principals        []string `yaml:"principals"`
+	TrustedAccounts   []string `yaml:"trusted_accounts"`
 	Client            Client   `yaml:"client"`
 	SigningKey        string   `yaml:"signing_key"`
 	CodeTTL           int      `yaml:"authorization_code_ttl_seconds"`
@@ -87,8 +89,8 @@ func (c *Config) Validate() error {
 			return errors.New("wildcard proxy trust is forbidden")
 		}
 	}
-	if len(c.Principals) == 0 {
-		return errors.New("explicit principals required")
+	if len(c.Principals) == 0 && len(c.TrustedAccounts) == 0 {
+		return errors.New("explicit principals or trusted_accounts required")
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Principals {
@@ -96,6 +98,17 @@ func (c *Config) Validate() error {
 			return errors.New("invalid or duplicate principal")
 		}
 		seen[p] = true
+	}
+	accounts := map[string]bool{}
+	for _, account := range c.TrustedAccounts {
+		if account == "" || len(account) > 192 || accounts[account] {
+			return errors.New("invalid or duplicate trusted account")
+		}
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(account))
+		if len(encoded) > 256 {
+			return errors.New("trusted account too long")
+		}
+		accounts[account] = true
 	}
 	if c.Client.ID == "" || len(c.Client.ID) > 128 || len(c.Client.Secret) < 32 || !httpsURL(c.Client.RedirectURI) {
 		return errors.New("client requires id, a secret of at least 32 bytes, and exact HTTPS redirect_uri")

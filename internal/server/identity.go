@@ -3,6 +3,7 @@ package server
 import (
 	"net"
 	"net/http"
+	"strings"
 )
 
 const principalHeader = "X-NetBird-Principal"
@@ -12,7 +13,11 @@ func (s *Server) identityFromRequest(r *http.Request) (string, bool) {
 		return "", false
 	}
 	values := r.Header.Values(principalHeader)
-	if len(values) != 1 || !principalPattern.MatchString(values[0]) || !s.principals[values[0]] {
+	if len(values) != 1 || !principalPattern.MatchString(values[0]) {
+		return "", false
+	}
+	account, _, _ := strings.Cut(values[0], ":")
+	if !s.principals[values[0]] && !s.trustedAccounts[account] {
 		return "", false
 	}
 	return "netbird:" + values[0], true
