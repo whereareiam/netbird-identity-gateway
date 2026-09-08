@@ -1,7 +1,7 @@
 .PHONY: build test test-race lint docker-build
 
 VERSION ?= dev
-IMAGE ?= ghcr.io/whereareiam/netbird-identity-gateway
+IMAGE ?= registry.whereareiam.me/images/whereareiam/netbird-identity-gateway
 
 build:
 	go build -ldflags="-s -w -X main.version=$(VERSION)" -o bin/netbird-identity-gateway ./cmd/netbird-identity-gateway
@@ -17,4 +17,4 @@ lint:
 	go vet ./...
 
 docker-build:
-	docker build --tag $(IMAGE):$(VERSION) .
+	docker build --build-arg VERSION=$(VERSION) --tag $(IMAGE):$(VERSION) .

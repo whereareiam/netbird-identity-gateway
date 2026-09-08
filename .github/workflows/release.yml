@@ -1,0 +1,76 @@
+name: Gateway release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: gateway-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.7'
+      - name: Validate release and prepare build metadata
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+              raise SystemExit('Expected a stable vMAJOR.MINOR.PATCH tag')
+          version = tag[1:]
+          notes = pathlib.Path('releases') / (version + '.md')
+          if not notes.is_file():
+              raise SystemExit('Release notes are required')
+          text = pathlib.Path('Dockerfile').read_text()
+          marker = 'ARG VERSION=dev\n'
+          if text.count(marker) != 1:
+              raise SystemExit('Unexpected Dockerfile version argument')
+          text = text.replace(marker, f'ARG VERSION={version}\n')
+          text += f'\nLABEL org.opencontainers.image.version="{version}"\n'
+          text += f'LABEL org.opencontainers.image.revision="{os.environ["SOURCE_REVISION"]}"\n'
+          text += 'LABEL org.opencontainers.image.source="https://github.com/whereareiam/netbird-identity-gateway"\n'
+          pathlib.Path('/tmp/identity-gateway-release.Dockerfile').write_text(text)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+      - name: Verify gateway
+        run: |
+          go test -race ./...
+          go vet ./...
+          python3 -m unittest discover -s deploy/authentik -p 'test_*.py'
+      - name: Publish public image
+        uses: whereareiam/devops/actions/registry/docker-publish@v2
+        with:
+          registry: registry.whereareiam.me
+          namespace: whereareiam
+          visibility: public
+          image: netbird-identity-gateway
+          dockerfile: /tmp/identity-gateway-release.Dockerfile
+          tags: ${{ steps.release.outputs.version }}
+      - name: Verify image version
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          image="registry.whereareiam.me/images/whereareiam/netbird-identity-gateway:$RELEASE_VERSION"
+          actual="$(docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+          test "$actual" = "$RELEASE_VERSION"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_VERSION" --notes-file "releases/$RELEASE_VERSION.md"

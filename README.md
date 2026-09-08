@@ -75,6 +75,13 @@ mode Authentik rejects identities that do not resolve through its pinned connect
 return 400. An exhausted code store returns 503. There is no interactive fallback.
 Logs contain method/path/duration, without headers, tokens or query strings.
 
+## Releases
+
+The stable gateway image is
+`registry.whereareiam.me/images/whereareiam/netbird-identity-gateway:1.0.0`.
+See [1.0.0 release notes](releases/1.0.0.md) for requirements and migration notes.
+Pin the published image digest in production deployments.
+
 ## Build and publish
 
 ```sh
@@ -87,6 +94,11 @@ Pushes to `dev` run tests and publish gateway and proxy images through the exist
 GitHub OIDC registry workflow. Each receives an immutable `dev-<commit>` tag and
 an overwritable `dev` tag under `registry.whereareiam.me/images/whereareiam/`.
 Deploy by digest when possible so rollback does not depend on the mutable tag.
+
+Stable `vMAJOR.MINOR.PATCH` tags run the gateway release workflow. It embeds the
+version in the binary, runs gateway/identity-linking checks, publishes the public
+versioned image and creates a GitHub release from `releases/<version>.md`. The
+NetBird proxy image is released separately.
 
 ## License
 
