@@ -1,0 +1,202 @@
+diff --git a/shared/signal/client/grpc.go b/shared/signal/client/grpc.go
+index 73c482e..5db6f4a 100644
+--- a/shared/signal/client/grpc.go
++++ b/shared/signal/client/grpc.go
+@@ -62,7 +62,8 @@ type GrpcClient struct {
+ 	connectedCh chan struct{}
+ 	mux         sync.Mutex
+ 	// StreamConnected indicates whether this client is StreamConnected to the Signal stream
+-	status Status
++	status           Status
++	streamRegistered atomic.Bool
+ 
+ 	connStateCallback     ConnStateNotifier
+ 	connStateCallbackLock sync.RWMutex
+@@ -234,7 +235,7 @@ func (c *GrpcClient) Receive(ctx context.Context, msgHandler func(msg *proto.Mes
+ 		// todo once the key rotation logic has been implemented, consider changing to some other identifier (received from management)
+ 		streamCtx, cancelStream := context.WithCancel(ctx)
+ 		defer cancelStream()
+-		stream, err := c.connect(streamCtx, c.key.PublicKey().String())
++		stream, err := c.connect(streamCtx, c.key.PublicKey().String(), cancelStream, 15*time.Second)
+ 		if err != nil {
+ 			log.Warnf("disconnected from the Signal Exchange due to an error: %v", err)
+ 			return err
+@@ -294,6 +295,7 @@ func (c *GrpcClient) notifyStreamDisconnected() {
+ 	c.mux.Lock()
+ 	defer c.mux.Unlock()
+ 	c.status = StreamDisconnected
++	c.streamRegistered.Store(false)
+ }
+ 
+ func (c *GrpcClient) notifyStreamConnected() {
+@@ -301,6 +303,7 @@ func (c *GrpcClient) notifyStreamConnected() {
+ 	defer c.mux.Unlock()
+ 
+ 	c.status = StreamConnected
++	c.streamRegistered.Store(true)
+ 	if c.connectedCh != nil {
+ 		// there are goroutines waiting on this channel -> release them
+ 		close(c.connectedCh)
+@@ -312,7 +315,11 @@ func (c *GrpcClient) notifyStreamConnected() {
+ 	}
+ }
+ 
+-func (c *GrpcClient) connect(ctx context.Context, key string) (proto.SignalExchange_ConnectStreamClient, error) {
++func (c *GrpcClient) connect(ctx context.Context, key string, cancelStream context.CancelFunc, registrationTimeout time.Duration) (proto.SignalExchange_ConnectStreamClient, error) {
++	// Registration must finish before the receive watchdog starts. A healthy
++	// HTTP/2 transport can otherwise leave Header blocked indefinitely.
++	registrationTimer := time.AfterFunc(registrationTimeout, cancelStream)
++	defer registrationTimer.Stop()
+ 	c.stream = nil
+ 
+ 	// add key fingerprint to the request header to be identified on the server side
+@@ -325,6 +332,9 @@ func (c *GrpcClient) connect(ctx context.Context, key string) (proto.SignalExcha
+ 	}
+ 	// blocks
+ 	header, err := c.stream.Header()
++	if !registrationTimer.Stop() && err == nil {
++		return nil, context.DeadlineExceeded
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -347,15 +357,9 @@ func (c *GrpcClient) Ready() bool {
+ // recorder accordingly. It does not actively probe: the watchdog
+ // (watchReceiveStream) owns probing the receive path and reconnecting.
+ func (c *GrpcClient) IsHealthy() bool {
+-	switch c.signalConn.GetState() {
+-	case connectivity.TransientFailure:
++	if !c.Ready() || !c.streamRegistered.Load() {
++		c.notifyDisconnected(errors.New("signal receive stream is not registered"))
+ 		return false
+-	case connectivity.Connecting:
+-		return true
+-	case connectivity.Shutdown:
+-		return true
+-	case connectivity.Idle:
+-	case connectivity.Ready:
+ 	}
+ 
+ 	if c.receiveStalled.Load() {
+diff --git a/shared/signal/client/registration_test.go b/shared/signal/client/registration_test.go
+new file mode 100644
+index 0000000..8c6e88f
+--- /dev/null
++++ b/shared/signal/client/registration_test.go
+@@ -0,0 +1,116 @@
++package client
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	sigProto "github.com/netbirdio/netbird/shared/signal/proto"
++	"github.com/stretchr/testify/require"
++	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/metadata"
++)
++
++type registrationTestServer struct {
++	sigProto.UnimplementedSignalExchangeServer
++	sendHeader bool
++}
++
++func (s *registrationTestServer) ConnectStream(stream sigProto.SignalExchange_ConnectStreamServer) error {
++	if s.sendHeader {
++		if err := stream.SendHeader(metadata.Pairs(sigProto.HeaderRegistered, "1")); err != nil {
++			return err
++		}
++	}
++	<-stream.Context().Done()
++	return stream.Context().Err()
++}
++
++func TestRegistrationTimeout(t *testing.T) {
++	for _, registered := range []bool{false, true} {
++		name := "stalled"
++		if registered {
++			name = "registered"
++		}
++		t.Run(name, func(t *testing.T) {
++			lis, err := net.Listen("tcp", "127.0.0.1:0")
++			require.NoError(t, err)
++			srv := grpc.NewServer()
++			sigProto.RegisterSignalExchangeServer(srv, &registrationTestServer{sendHeader: registered})
++			go srv.Serve(lis)
++			defer srv.Stop()
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			key, err := wgtypes.GenerateKey()
++			require.NoError(t, err)
++			c, err := NewClient(ctx, lis.Addr().String(), key, false)
++			require.NoError(t, err)
++			defer c.Close()
++			require.Eventually(t, c.Ready, time.Second, time.Millisecond)
++			require.False(t, c.IsHealthy(), "transport readiness must not imply registration")
++			started := time.Now()
++			stream, err := c.connect(ctx, key.PublicKey().String(), cancel, 100*time.Millisecond)
++			if !registered {
++				require.Error(t, err)
++				require.Less(t, time.Since(started), time.Second)
++				require.False(t, c.IsHealthy())
++				return
++			}
++			require.NoError(t, err)
++			c.notifyStreamConnected()
++			require.True(t, c.IsHealthy())
++			select {
++			case <-stream.Context().Done():
++				t.Fatal("registration timeout canceled an established stream")
++			case <-time.After(250 * time.Millisecond):
++			}
++		})
++	}
++}
++
++// A canceled registration attempt must not cancel the parent's Receive loop.
++func TestRegistrationReconnect(t *testing.T) {
++	lis, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	srv := grpc.NewServer()
++	backend := &reconnectingRegistrationServer{}
++	sigProto.RegisterSignalExchangeServer(srv, backend)
++	go srv.Serve(lis)
++	defer srv.Stop()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	key, err := wgtypes.GenerateKey()
++	require.NoError(t, err)
++	c, err := NewClient(ctx, lis.Addr().String(), key, false)
++	require.NoError(t, err)
++	defer c.Close()
++	done := make(chan error, 1)
++	go func() { done <- c.Receive(ctx, func(*sigProto.Message) error { return nil }) }()
++	require.Eventually(t, func() bool { return c.streamRegistered.Load() }, 25*time.Second, 20*time.Millisecond)
++	require.GreaterOrEqual(t, backend.calls.Load(), int32(2))
++	require.NoError(t, ctx.Err())
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("Receive did not stop after parent cancellation")
++	}
++}
++
++type reconnectingRegistrationServer struct {
++	sigProto.UnimplementedSignalExchangeServer
++	calls atomic.Int32
++}
++
++func (s *reconnectingRegistrationServer) ConnectStream(stream sigProto.SignalExchange_ConnectStreamServer) error {
++	if s.calls.Add(1) > 1 {
++		if err := stream.SendHeader(metadata.Pairs(sigProto.HeaderRegistered, "1")); err != nil {
++			return err
++		}
++	}
++	<-stream.Context().Done()
++	return stream.Context().Err()
++}

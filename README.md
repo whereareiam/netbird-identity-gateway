@@ -75,6 +75,9 @@ mode Authentik rejects identities that do not resolve through its pinned connect
 return 400. An exhausted code store returns 503. There is no interactive fallback.
 Logs contain method/path/duration, without headers, tokens or query strings.
 
+For proxy and routing-client builds, health probes, signal recovery and persistent
+peer identities, see [NetBird operations](deploy/netbird/README.md).
+
 ## Releases
 
 The stable gateway image is
