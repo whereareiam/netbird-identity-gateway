@@ -17,6 +17,11 @@ and registration regression tests. The client target contains the standard
 NetBird container entrypoint and a patched `/usr/local/bin/netbird` binary.
 The proxy target is the default final stage.
 
+`Dockerfile.server` keeps the upstream management server binary and adds the
+PostgreSQL client. The cluster uses it to reset abandoned connection flags before
+every process start, including container restarts. The SQL and wrapper command
+belong to the cluster deployment; this image alone does not change database state.
+
 ## Recover signal connections
 
 Signal registration has a 15-second timeout. It covers the interval before the
